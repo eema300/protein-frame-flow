@@ -6,9 +6,10 @@ residue, selected from the *current noisy structure* at every sampling step.
 This is an inference-time intervention on a pretrained dense model: no weights
 are changed and no retraining is involved.
 
-The restriction is applied as a multiplicative gate on the pairwise validity
-mask that IPA already builds immediately before its softmax, so a neighborhood
-covering every residue reproduces the dense model exactly.
+The restriction is applied to the pairwise validity mask that IPA builds
+immediately before its softmax, while that mask is still 0/1 and before
+FrameFlow converts it to an additive bias (`self.inf * (square_mask - 1)`),
+so a neighborhood covering every residue reproduces the dense model exactly.
 
 Three neighborhood modes are provided. The two non-spatial ones are controls:
 without them a result like "k=32 preserves designability" cannot distinguish
@@ -63,7 +64,6 @@ class SparsityConfig:
         target: What the rule restricts: "ipa" (structure-module attention),
             "tri" (the third residue in the trunk's triangle updates), or
             "ipa,tri" for both.
-        radius: Cutoff in Angstrom for the "radius" mode.
         union: Triangle updates keep a mediator k near i or near j, instead
             of near both.
         tri_t_lo, tri_t_hi: Timestep window for the triangle gate. None falls
@@ -83,15 +83,6 @@ class SparsityConfig:
     t_hi: float = 1.0
     layers: List[int] = field(default_factory=list)
     seed: int = 0
-    eps: float = 0.01
-    term: str = "full"
-    shared: bool = False
-    alpha: float = 1.5
-    target: str = "ipa"
-    radius: float = 8.0
-    union: bool = False
-    tri_t_lo: Optional[float] = None
-    tri_t_hi: Optional[float] = None
 
     def k_at(self, t_frac: Optional[float], n: int) -> int:
         """Budget for this timestep. Fig. 5 measured the need falling steeply
@@ -153,14 +144,6 @@ class SparsityConfig:
 CONFIG = SparsityConfig()
 _T_FRAC: Optional[float] = None
 _STEP_IDX: int = 0
-# Native CA coordinates [B, N, 3] for mode "oracle": k-NN chosen from the true
-# structure instead of the noisy one. Only the ground-truth denoising script
-# sets it; sampling has no true structure to offer.
-ORACLE: Optional[torch.Tensor] = None
-# Noisy CA coordinates [B, N, 3] of the current forward pass, published by the
-# denoiser: the trunk sees no frames, so the triangle gate has no other way
-# to know where residues are.
-TRUNK_COORDS: Optional[torch.Tensor] = None
 
 
 def configure(**kwargs) -> SparsityConfig:
@@ -191,7 +174,7 @@ def configure_from_env() -> SparsityConfig:
     Recognised variables:
         PB_SPARSE_ENABLED     1/0
         PB_SPARSE_K           int
-        PB_SPARSE_MODE        knn | random | seq | radius
+        PB_SPARSE_MODE        knn | random | seq
         PB_SPARSE_SYMMETRIZE  1/0
         PB_SPARSE_TLO         float
         PB_SPARSE_THI         float
@@ -219,16 +202,7 @@ def configure_from_env() -> SparsityConfig:
     CONFIG.t_lo = float(os.environ.get("PB_SPARSE_TLO", CONFIG.t_lo))
     CONFIG.t_hi = float(os.environ.get("PB_SPARSE_THI", CONFIG.t_hi))
     CONFIG.seed = int(os.environ.get("PB_SPARSE_SEED", CONFIG.seed))
-    CONFIG.eps = float(os.environ.get("PB_SPARSE_EPS", CONFIG.eps))
-    CONFIG.term = os.environ.get("PB_SPARSE_TERM", CONFIG.term)
-    CONFIG.alpha = float(os.environ.get("PB_SPARSE_ALPHA", CONFIG.alpha))
     CONFIG.target = os.environ.get("PB_SPARSE_TARGET", CONFIG.target)
-    CONFIG.radius = float(os.environ.get("PB_SPARSE_RADIUS", CONFIG.radius))
-    CONFIG.union = _flag("PB_SPARSE_UNION", CONFIG.union)
-    if os.environ.get("PB_SPARSE_TRI_TLO"):
-        CONFIG.tri_t_lo = float(os.environ["PB_SPARSE_TRI_TLO"])
-    if os.environ.get("PB_SPARSE_TRI_THI"):
-        CONFIG.tri_t_hi = float(os.environ["PB_SPARSE_TRI_THI"])
     raw_layers = os.environ.get("PB_SPARSE_LAYERS")
     if raw_layers is not None:
         CONFIG.layers = [int(x) for x in raw_layers.split(",") if x.strip()]
@@ -245,13 +219,13 @@ def timestep(t_frac: float, step_idx: int = 0):
 
     Args:
         t_frac: Timestep as a fraction of the total, 1.0 at the noisiest
-            step and approaching 0.0 at the last.
+            step and approaching 0.0 at the last. -> convert to frame flow time step notation (0.0 at noisiest, approaching 1.0 at last step)
         step_idx: Monotonic index of the sampling step, used to decorrelate
             the random-control neighborhoods across steps.
     """
     global _T_FRAC, _STEP_IDX
     prev_frac, prev_idx = _T_FRAC, _STEP_IDX
-    _T_FRAC, _STEP_IDX = float(t_frac), int(step_idx)
+    _T_FRAC, _STEP_IDX = float(1.0 - t_frac), int(step_idx)
     try:
         yield
     finally:
@@ -294,23 +268,13 @@ def neighborhood_mask(
 
     eye = torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)
 
-    if cfg.mode == "radius":
-        # Everything within the cutoff, however many that is: the budget
-        # follows the structure's density, not a fixed k. Symmetric by
-        # construction.
-        d = torch.cdist(coords.float(), coords.float())
-        mask = ((d < cfg.radius) & valid_b.unsqueeze(-2) & valid_b.unsqueeze(-1)) | (eye & valid_b.unsqueeze(-1))
-        return mask.to(coords.dtype)
-
     k_eff = min(cfg.k_at(_T_FRAC, int(valid_b.sum(-1).max())), N)
     if k_eff >= N:
         # Nothing to restrict; return an all-ones mask so that the caller
         # reproduces dense attention bit-for-bit.
         return torch.ones(B, N, N, device=device, dtype=coords.dtype)
 
-    if cfg.mode in ("knn", "oracle"):
-        score = torch.cdist(coords.float(), coords.float())
-    elif cfg.mode == "seq":
+    if cfg.mode == "seq":
         pos = torch.arange(N, device=device, dtype=torch.float32)
         score = (pos.unsqueeze(-1) - pos.unsqueeze(-2)).abs().unsqueeze(0)
         score = score.expand(B, N, N).contiguous()
@@ -366,211 +330,9 @@ def apply_to_pair_mask(
     Returns:
         torch.Tensor: [B, N, N] gated mask.
     """
-    if coords is None or "ipa" not in CONFIG.target.split(",") or CONFIG.mode in ("thresh", "entmax") \
-            or not CONFIG.active_at(_T_FRAC, layer_idx):
+    if coords is None or not CONFIG.active_at(_T_FRAC, layer_idx):
         return square_mask
-    if CONFIG.mode == "oracle":
-        coords = ORACLE
     return square_mask * neighborhood_mask(coords, valid)
-
-
-def logit_threshold(a, geom, valid, layer_idx=None):
-    """Per-head keep mask (B, H, N, N) for mode "thresh", or None when inactive."""
-    if CONFIG.mode != "thresh" or "ipa" not in CONFIG.target.split(",") or not CONFIG.active_at(_T_FRAC, layer_idx):
-        return None
-    valid_b = valid.bool()
-    N = a.shape[-1]
-    # A key more than log(n/eps) below its row max has softmax weight under
-    # eps/n, so everything dropped carries under eps of the row's mass. With
-    # term="full" that bound holds for the attention actually used. With
-    # term="geom" it holds for the distance term alone: the budget is still
-    # adaptive, but chosen by geometry, which is what kNN approximates.
-    if CONFIG.term == "full":
-        s = a
-    else:
-        s = geom.masked_fill(~valid_b[:, None, None, :], float("-inf"))
-    if CONFIG.shared:
-        # One set for every head, like kNN; the bound then holds only for the
-        # head-averaged logits, not for each head's attention.
-        s = s.mean(1, keepdim=True)
-    n = valid_b.sum(-1).float()[:, None, None, None]
-    keep = s >= s.amax(-1, keepdim=True) - torch.log(n / CONFIG.eps)
-    # Self is always kept, as in the kNN modes; adding keys cannot loosen the bound.
-    eye = torch.eye(N, device=a.device, dtype=torch.bool)
-    return keep | eye
-
-
-_TRI_LOGGED = None
-
-
-def triangle_gate(pair_mask):
-    """Mediator gate [B, G+N, G+N] for a trunk triangle update, or None when inactive."""
-    if "tri" not in CONFIG.target.split(",") or CONFIG.mode not in ("knn", "oracle", "random", "seq", "radius"):
-        return None
-    lo = CONFIG.t_lo if CONFIG.tri_t_lo is None else CONFIG.tri_t_lo
-    hi = CONFIG.t_hi if CONFIG.tri_t_hi is None else CONFIG.tri_t_hi
-    if not CONFIG.enabled or (_T_FRAC is not None and not (lo <= _T_FRAC <= hi)):
-        return None
-    coords = ORACLE if CONFIG.mode == "oracle" else TRUNK_COORDS
-    B, N = coords.shape[:2]
-    G = pair_mask.shape[-1] - N  # global tokens are prepended and stay fully connected
-    valid = pair_mask.diagonal(dim1=-2, dim2=-1)[:, G:]
-    m = torch.ones_like(pair_mask)
-    nb = neighborhood_mask(coords, valid)
-    m[:, G:, G:] = nb
-    record_triangle(nb, valid)
-    # The caller masks a_ik by m_ik and b_jk by m_jk (m is symmetric). Both
-    # masked: k must neighbour i and j. With CONFIG.union: i or j.
-    return m
-
-
-@torch.no_grad()
-def record_triangle(nb, valid):
-    """Mean residue mediators per residue pair i != j, once per sampling step."""
-    global _TRI_LOGGED
-    if not RECORD or _TRI_LOGGED == (_STEP_IDX, _T_FRAC):
-        return
-    if RECORD_STRIDE > 1 and (_STEP_IDX % RECORD_STRIDE) != 0:
-        return
-    _TRI_LOGGED = (_STEP_IDX, _T_FRAC)
-    v = valid.float()
-    both = torch.matmul(nb, nb.transpose(-1, -2))
-    deg = nb.sum(-1)
-    either = deg.unsqueeze(-1) + deg.unsqueeze(-2) - both
-    pair = v.unsqueeze(-1) * v.unsqueeze(-2) * (1 - torch.eye(nb.shape[-1], device=nb.device))
-    mean = lambda x: float((x * pair).sum() / pair.sum().clamp_min(1))
-    _RECORDS.append({
-        "target": "tri", "step": _STEP_IDX, "t": _T_FRAC, "n": int(v.sum(-1).max()),
-        "mode": CONFIG.mode, "union": CONFIG.union,
-        "med_and": mean(both), "med_or": mean(either),
-        "med_kept": mean(either if CONFIG.union else both),
-    })
-
-
-ENTMAX_ITERS = 50
-
-
-def entmax(a, layer_idx=None):
-    """alpha-entmax over keys (B, H, N, N) for mode "entmax", or None when inactive."""
-    if CONFIG.mode != "entmax" or "ipa" not in CONFIG.target.split(",") or not CONFIG.active_at(_T_FRAC, layer_idx):
-        return None
-    al = CONFIG.alpha
-    # Softmax-trained logits used as-is: the direct conversion of AdaSplash-2
-    # Table 6, with no temperature fitted. Bisection on the threshold within
-    # the Peters et al. bracket; N <= 500 so there is no need for their kernels.
-    z = (al - 1) * a.float()
-    mx = z.amax(-1, keepdim=True)
-    lo, hi = mx - 1, mx - a.shape[-1] ** (1 - al)
-    for _ in range(ENTMAX_ITERS):
-        tau = (lo + hi) / 2
-        f = (z - tau).clamp_min(0).pow(1 / (al - 1)).sum(-1, keepdim=True) - 1
-        lo, hi = torch.where(f > 0, tau, lo), torch.where(f > 0, hi, tau)
-    # lo never exceeds the true threshold, so the support can only be a
-    # superset of the exact one (their Prop. 1); renormalise the residual.
-    p = (z - lo).clamp_min(0).pow(1 / (al - 1))
-    return (p / p.sum(-1, keepdim=True)).to(a.dtype)
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 instrumentation: how local is dense attention already?
-# ---------------------------------------------------------------------------
-
-RECORD: bool = False
-RECORD_KS: List[int] = [8, 16, 32, 64, 128]
-RECORD_STRIDE: int = 1
-_RECORDS: List[dict] = []
-
-# ---------------------------------------------------------------------------
-# Step-by-step trace: what the neighborhood rule keeps and what it discards
-# ---------------------------------------------------------------------------
-#
-# The locality recorder above answers "how much mass is within k neighbors".
-# The trace answers the next question: *which* mass the rule discards, where
-# that mass sits, and which residues lose it. Run it on a dense trajectory and
-# the discarded mass is counterfactual - what k-NN would have removed had it
-# been on; run it on a restricted trajectory and it is the residual, which
-# should be ~0 and serves as a check.
-
-TRACE: bool = False
-TRACE_STRIDE: int = 1
-_TRACES: List[dict] = []
-# Angstrom and |i - j| bin edges. The last bin of each is open.
-DIST_EDGES = [0.0, 6.0, 8.0, 10.0, 12.0, 16.0, 24.0, 40.0]
-SEP_EDGES = [1, 2, 4, 8, 16, 32, 64, 128]
-
-
-@contextlib.contextmanager
-def tracing(stride: int = 1):
-    """Collect per-step, per-layer neighborhood traces for the enclosed block."""
-    global TRACE, TRACE_STRIDE, _TRACES
-    prev, prev_stride = TRACE, TRACE_STRIDE
-    TRACE, TRACE_STRIDE = True, int(stride)
-    _TRACES = []
-    try:
-        yield _TRACES
-    finally:
-        TRACE, TRACE_STRIDE = prev, prev_stride
-
-
-def take_traces() -> List[dict]:
-    """Drain the collected traces."""
-    global _TRACES
-    out, _TRACES = _TRACES, []
-    return out
-
-
-@torch.no_grad()
-def _trace_step(a, coords, valid, layer_idx):
-    """Mass the neighborhood rule keeps and drops at this step and layer."""
-    if TRACE_STRIDE > 1 and (_STEP_IDX % TRACE_STRIDE) != 0:
-        return
-    valid_b = valid.bool()
-    B, H, N, _ = a.shape
-    rows = valid_b.unsqueeze(1).expand(B, H, N)
-
-    # The neighborhood the current config would select here, whether or not it
-    # is actually being applied on this trajectory.
-    nb = neighborhood_mask(coords, valid).unsqueeze(1)
-    kept = (a * nb).sum(-1)
-    drop = a * (1 - nb)
-
-    d = torch.cdist(coords.float(), coords.float()).unsqueeze(1)
-    pos = torch.arange(N, device=a.device)
-    sep = (pos.unsqueeze(-1) - pos.unsqueeze(-2)).abs().float()[None, None]
-
-    def hist(x, edges):
-        # Mass per bin, normalised by total dropped mass, so the bins say
-        # where the loss came from rather than how big it was.
-        tot = drop.sum().clamp_min(1e-12)
-        out = []
-        for i, lo in enumerate(edges):
-            hi = edges[i + 1] if i + 1 < len(edges) else float("inf")
-            out.append(round(float((drop * ((x >= lo) & (x < hi))).sum() / tot), 5))
-        return out
-
-    # Radius of the neighborhood: how far the rule actually reaches at this
-    # step. It grows over sampling rather than shrinking - at t/T = 1 the
-    # coordinates sit at prior scale, so 32 neighbours fit inside ~1 A and the
-    # graph is spatially meaningless; it reaches physical scale (~18 A at
-    # L = 100) only once the structure has expanded.
-    reach = (d.squeeze(1) * nb.squeeze(1)).amax(-1)
-
-    per_res = (1 - kept).mean(1)  # [B, N], dropped mass per residue
-    _TRACES.append({
-        "layer": layer_idx,
-        "step": _STEP_IDX,
-        "t_frac": _T_FRAC,
-        "n_res": int(valid_b.sum(-1).max()),
-        "k": CONFIG.k_at(_T_FRAC, int(valid_b.sum(-1).max())),
-        "keys": round(float((nb.squeeze(1).sum(-1) * valid_b).sum() / valid_b.sum().clamp_min(1)), 2),
-        "kept": round(float((kept * rows).sum() / rows.sum().clamp_min(1)), 5),
-        "kept_by_head": [round(float(x), 4) for x in
-                         ((kept * rows).sum(-1) / rows.sum(-1).clamp_min(1)).mean(0)],
-        "reach": round(float((reach * valid_b).sum() / valid_b.sum().clamp_min(1)), 2),
-        "drop_by_dist": hist(d, DIST_EDGES),
-        "drop_by_sep": hist(sep, SEP_EDGES),
-        "drop_per_res": [round(float(x), 4) for x in per_res[0][: int(valid_b[0].sum())]],
-    })
 
 
 def recording_enabled_from_env() -> Optional[str]:
@@ -621,128 +383,113 @@ def recording(ks: Optional[List[int]] = None):
     finally:
         RECORD, RECORD_KS = prev_record, prev_ks
 
+# @torch.no_grad()
+# def record_attention(
+#     a: torch.Tensor,
+#     coords: Optional[torch.Tensor],
+#     valid: torch.Tensor,
+#     layer_idx: Optional[int] = None,
+#     parts: Optional[dict] = None,
+#     mask_logits: Optional[torch.Tensor] = None,
+# ) -> None:
+#     """
+#     Measure how much attention mass falls inside spatial neighborhoods.
 
-def take_records() -> List[dict]:
-    """
-    Drain the recorded statistics.
+#     This answers the question the masking experiment presupposes: before
+#     restricting anything, how much of the dense model's attention is already
+#     spatially local, and how does that change over the trajectory?
 
-    Returns:
-        list[dict]: One entry per recorded IPA call.
-    """
-    global _RECORDS
-    out, _RECORDS = _RECORDS, []
-    return out
+#     Args:
+#         a: [B, H, N, N] post-softmax attention weights.
+#         coords: [B, N, 3] current noisy coordinates, or None.
+#         valid: [B, N] residue mask.
+#         layer_idx: Index of the calling layer.
+#     """
+#     if not RECORD or coords is None:
+#         return
+#     if RECORD_STRIDE > 1 and (_STEP_IDX % RECORD_STRIDE) != 0:
+#         return
 
+#     valid_b = valid.bool()
+#     B, H, N, _ = a.shape
+#     n_real = valid_b.sum(-1)
 
-@torch.no_grad()
-def record_attention(
-    a: torch.Tensor,
-    coords: Optional[torch.Tensor],
-    valid: torch.Tensor,
-    layer_idx: Optional[int] = None,
-    parts: Optional[dict] = None,
-    mask_logits: Optional[torch.Tensor] = None,
-) -> None:
-    """
-    Measure how much attention mass falls inside spatial neighborhoods.
+#     # Entropy of each query's attention, averaged over real residues/heads.
+#     p = a.clamp_min(1e-12)
+#     ent = -(p * p.log()).sum(-1)
+#     row_valid = valid_b.unsqueeze(1).expand(B, H, N)
+#     mean_ent = (ent * row_valid).sum() / row_valid.sum().clamp_min(1)
 
-    This answers the question the masking experiment presupposes: before
-    restricting anything, how much of the dense model's attention is already
-    spatially local, and how does that change over the trajectory?
+#     dist = torch.cdist(coords.float(), coords.float())
+#     dist = dist.masked_fill(~valid_b.unsqueeze(-2), float("inf"))
+#     eye = torch.eye(N, device=a.device, dtype=torch.bool).unsqueeze(0)
+#     dist = dist.masked_fill(eye, -1.0)
+#     order = dist.argsort(dim=-1)
 
-    Args:
-        a: [B, H, N, N] post-softmax attention weights.
-        coords: [B, N, 3] current noisy coordinates, or None.
-        valid: [B, N] residue mask.
-        layer_idx: Index of the calling layer.
-    """
-    if TRACE and coords is not None:
-        _trace_step(a, coords, valid, layer_idx)
-    if not RECORD or coords is None:
-        return
-    if RECORD_STRIDE > 1 and (_STEP_IDX % RECORD_STRIDE) != 0:
-        return
+#     # Per head as well as pooled: a mean over 8 heads cannot distinguish
+#     # "all heads moderately local" from "half global, half pinned", and those
+#     # imply different things about what a sparse architecture could drop.
+#     ent_h = (ent * row_valid).sum(-1) / row_valid.sum(-1).clamp_min(1)  # (B, H)
+#     eff_h = ent_h.exp().mean(0)                                         # (H,)
 
-    valid_b = valid.bool()
-    B, H, N, _ = a.shape
-    n_real = valid_b.sum(-1)
+#     entry = {
+#         "layer": layer_idx,
+#         "t_frac": _T_FRAC,
+#         "step": _STEP_IDX,
+#         "n_res": float(n_real.float().mean()),
+#         "attn_entropy": float(mean_ent),
+#         "eff_neighbors": float(mean_ent.exp()),
+#         "eff_by_head": [round(float(x), 3) for x in eff_h],
+#         # exp(mean entropy) is a geometric mean over (residue, head), so a few
+#         # global heads get buried by many local ones. The arithmetic version
+#         # keeps them visible; reporting both shows the heterogeneity.
+#         "eff_arith": float(((ent.exp() * row_valid).sum() / row_valid.sum().clamp_min(1))),
+#     }
 
-    # Entropy of each query's attention, averaged over real residues/heads.
-    p = a.clamp_min(1e-12)
-    ent = -(p * p.log()).sum(-1)
-    row_valid = valid_b.unsqueeze(1).expand(B, H, N)
-    mean_ent = (ent * row_valid).sum() / row_valid.sum().clamp_min(1)
+#     # Keys with nonzero weight. Masked logits sit ~1e5 down and underflow to
+#     # exactly 0, so under a hard restriction this is the kept set; it is how
+#     # the adaptive modes report the budget they chose.
+#     sup = (a > 0).sum(-1).float()                                       # (B, H, N)
+#     sup_h = (sup * row_valid).sum(-1) / row_valid.sum(-1).clamp_min(1)  # (B, H)
+#     entry["support"] = float((sup * row_valid).sum() / row_valid.sum().clamp_min(1))
+#     entry["support_by_head"] = [round(float(x), 2) for x in sup_h.mean(0)]
 
-    dist = torch.cdist(coords.float(), coords.float())
-    dist = dist.masked_fill(~valid_b.unsqueeze(-2), float("inf"))
-    eye = torch.eye(N, device=a.device, dtype=torch.bool).unsqueeze(0)
-    dist = dist.masked_fill(eye, -1.0)
-    order = dist.argsort(dim=-1)
+#     # Each logit term softmaxed alone, on the real noised trajectory. The
+#     # distance term is architectural and present at init; the content term is
+#     # learned. Without separating them, a broad early curve cannot distinguish
+#     # the trained model overriding the geometric prior from that prior simply
+#     # being dormant at prior-scale coordinates.
+#     if parts is not None:
+#         # All 8 subsets of {content, pair, geom}, mask always on. Standalone
+#         # and leave-one-out bound the interaction from opposite sides: a term
+#         # alone versus a term absent. They agree only if it acts additively,
+#         # and the full attention here is sharper than every standalone term,
+#         # which already says they do not. Shapley over these 8 is then an
+#         # order-independent attribution. The empty subset is uniform over
+#         # valid residues and doubles as a sanity check.
+#         names = ["content", "pair", "geom"]
+#         terms = [parts[n] for n in names]
+#         for bits in range(8):
+#             sel = [i for i in range(3) if (bits >> i) & 1]
+#             logits = torch.zeros_like(a) if mask_logits is None else mask_logits.expand_as(a).clone()
+#             for i in sel:
+#                 logits = logits + terms[i]
+#             q = torch.softmax(logits, dim=-1).clamp_min(1e-12)
+#             e = -(q * q.log()).sum(-1)
+#             mm = (e * row_valid).sum() / row_valid.sum().clamp_min(1)
+#             key = "".join(names[i][0] for i in sel) or "none"
+#             entry[f"eff_s_{key}"] = round(float(mm.exp()), 3)
 
-    # Per head as well as pooled: a mean over 12 heads cannot distinguish
-    # "all heads moderately local" from "half global, half pinned", and those
-    # imply different things about what a sparse architecture could drop.
-    ent_h = (ent * row_valid).sum(-1) / row_valid.sum(-1).clamp_min(1)  # (B, H)
-    eff_h = ent_h.exp().mean(0)                                         # (H,)
+#     # Fraction of attention mass captured by the k nearest neighbors.
+#     for k in RECORD_KS:
+#         if k >= N:
+#             entry[f"mass_k{k}"] = 1.0
+#             continue
+#         idx = order[..., :k]
+#         gathered = a.gather(-1, idx.unsqueeze(1).expand(B, H, N, k))
+#         mass = gathered.sum(-1)
+#         entry[f"mass_k{k}"] = float(
+#             (mass * row_valid).sum() / row_valid.sum().clamp_min(1)
+#         )
 
-    entry = {
-        "layer": layer_idx,
-        "t_frac": _T_FRAC,
-        "step": _STEP_IDX,
-        "n_res": float(n_real.float().mean()),
-        "attn_entropy": float(mean_ent),
-        "eff_neighbors": float(mean_ent.exp()),
-        "eff_by_head": [round(float(x), 3) for x in eff_h],
-        # exp(mean entropy) is a geometric mean over (residue, head), so a few
-        # global heads get buried by many local ones. The arithmetic version
-        # keeps them visible; reporting both shows the heterogeneity.
-        "eff_arith": float(((ent.exp() * row_valid).sum() / row_valid.sum().clamp_min(1))),
-    }
-
-    # Keys with nonzero weight. Masked logits sit ~1e5 down and underflow to
-    # exactly 0, so under a hard restriction this is the kept set; it is how
-    # the adaptive modes report the budget they chose.
-    sup = (a > 0).sum(-1).float()                                       # (B, H, N)
-    sup_h = (sup * row_valid).sum(-1) / row_valid.sum(-1).clamp_min(1)  # (B, H)
-    entry["support"] = float((sup * row_valid).sum() / row_valid.sum().clamp_min(1))
-    entry["support_by_head"] = [round(float(x), 2) for x in sup_h.mean(0)]
-
-    # Each logit term softmaxed alone, on the real noised trajectory. The
-    # distance term is architectural and present at init; the content term is
-    # learned. Without separating them, a broad early curve cannot distinguish
-    # the trained model overriding the geometric prior from that prior simply
-    # being dormant at prior-scale coordinates.
-    if parts is not None:
-        # All 8 subsets of {content, pair, geom}, mask always on. Standalone
-        # and leave-one-out bound the interaction from opposite sides: a term
-        # alone versus a term absent. They agree only if it acts additively,
-        # and the full attention here is sharper than every standalone term,
-        # which already says they do not. Shapley over these 8 is then an
-        # order-independent attribution. The empty subset is uniform over
-        # valid residues and doubles as a sanity check.
-        names = ["content", "pair", "geom"]
-        terms = [parts[n] for n in names]
-        for bits in range(8):
-            sel = [i for i in range(3) if (bits >> i) & 1]
-            logits = torch.zeros_like(a) if mask_logits is None else mask_logits.expand_as(a).clone()
-            for i in sel:
-                logits = logits + terms[i]
-            q = torch.softmax(logits, dim=-1).clamp_min(1e-12)
-            e = -(q * q.log()).sum(-1)
-            mm = (e * row_valid).sum() / row_valid.sum().clamp_min(1)
-            key = "".join(names[i][0] for i in sel) or "none"
-            entry[f"eff_s_{key}"] = round(float(mm.exp()), 3)
-
-    # Fraction of attention mass captured by the k nearest neighbors.
-    for k in RECORD_KS:
-        if k >= N:
-            entry[f"mass_k{k}"] = 1.0
-            continue
-        idx = order[..., :k]
-        gathered = a.gather(-1, idx.unsqueeze(1).expand(B, H, N, k))
-        mass = gathered.sum(-1)
-        entry[f"mass_k{k}"] = float(
-            (mass * row_valid).sum() / row_valid.sum().clamp_min(1)
-        )
-
-    _RECORDS.append(entry)
+#     _RECORDS.append(entry)

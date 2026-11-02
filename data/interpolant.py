@@ -7,6 +7,7 @@ from data import all_atom
 import copy
 from torch import autograd
 from motif_scaffolding import twisting
+from models import sparse_pair
 
 
 def _centered_gaussian(num_batch, num_res, device):
@@ -247,16 +248,17 @@ class Interpolant:
 
             use_twisting = motif_scaffolding and self._cfg.twisting.use and t_1 >= self._cfg.twisting.t_min
 
-            if use_twisting: # Reconstruction guidance
-                with torch.inference_mode(False):
-                    batch, Log_delta_R, delta_x = twisting.perturbations_for_grad(batch)
-                    model_out = model(batch)
-                    t = batch['r3_t'] #TODO: different time for SO3?
-                    trans_t_1, rotmats_t_1, logs_traj = self.guidance(trans_t_1, rotmats_t_1, model_out, motif_mask, R_motif, trans_motif, Log_delta_R, delta_x, t, d_t, logs_traj)
+            with sparse_pair.timestep(float(t_1), i):
+                if use_twisting: # Reconstruction guidance
+                    with torch.inference_mode(False):
+                        batch, Log_delta_R, delta_x = twisting.perturbations_for_grad(batch)
+                        model_out = model(batch)
+                        t = batch['r3_t'] #TODO: different time for SO3?
+                        trans_t_1, rotmats_t_1, logs_traj = self.guidance(trans_t_1, rotmats_t_1, model_out, motif_mask, R_motif, trans_motif, Log_delta_R, delta_x, t, d_t, logs_traj)
 
-            else:
-                with torch.no_grad():
-                    model_out = model(batch)
+                else:
+                    with torch.no_grad():
+                        model_out = model(batch)
 
             # Process model output.
             pred_trans_1 = model_out['pred_trans']

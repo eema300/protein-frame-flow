@@ -23,6 +23,7 @@ import torch.nn as nn
 from typing import Optional, Callable, List, Sequence
 from openfold.utils.rigid_utils import Rigid
 from data import all_atom
+from models import sparse_pair
 
 
 def permute_final_dims(tensor: torch.Tensor, inds: List[int]):
@@ -284,6 +285,7 @@ class InvariantPointAttention(nn.Module):
         self.no_v_points = ipa_conf.no_v_points
         self.inf = inf
         self.eps = eps
+        self.layer_idx = None
 
         # These linear layers differ from their specifications in the
         # supplement. There, they lack bias and use Glorot initialization.
@@ -421,6 +423,9 @@ class InvariantPointAttention(nn.Module):
         pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
         # [*, N_res, N_res]
         square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+        square_mask = sparse_pair.apply_to_pair_mask(
+            square_mask, r.get_trans(), mask, self.layer_idx
+        )
         square_mask = self.inf * (square_mask - 1)
 
         # [*, H, N_res, N_res]
