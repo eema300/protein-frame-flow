@@ -15,7 +15,7 @@ inference:
   output_dir: inference_outputs/
 
   # Choose checkpoint path
-  ckpt_path: null
+  ckpt_path: "/ocean/projects/cis260266p/egomez4/protein-frame-flow/weights/pdb/published.ckp"
 
   use_gpu: True
   num_gpus: 2
