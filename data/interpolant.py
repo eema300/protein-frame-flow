@@ -8,6 +8,7 @@ import copy
 from torch import autograd
 from motif_scaffolding import twisting
 from models import sparse_pair
+import os, json
 
 
 def _centered_gaussian(num_batch, num_res, device):
@@ -324,6 +325,15 @@ class Interpolant:
         # Convert trajectories to atom37.
         atom37_traj = all_atom.transrot_to_atom37(prot_traj, res_mask)
         clean_atom37_traj = all_atom.transrot_to_atom37(clean_traj, res_mask)
+        
+        # save the collected records to disk
+        out = os.environ.get("PB_RECORD_OUT")
+        if out:
+            recs = sparse_pair.take_records()
+            with open(out, "a") as f:
+                for r in recs:
+                    f.write(json.dumps(r) + "\n")
+        
         return atom37_traj, clean_atom37_traj, clean_traj
 
     def guidance(self, trans_t, rotmats_t, model_out, motif_mask, R_motif, trans_motif, Log_delta_R, delta_x, t, d_t, logs_traj):

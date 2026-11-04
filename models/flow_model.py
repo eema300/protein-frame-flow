@@ -23,6 +23,7 @@ class FlowModel(nn.Module):
         self.trunk = nn.ModuleDict()
         for b in range(self._ipa_conf.num_blocks):
             self.trunk[f'ipa_{b}'] = ipa_pytorch.InvariantPointAttention(self._ipa_conf)
+            self.trunk[f'ipa_{b}'].layer_idx = b # save info on what layer we are on for the recording
             self.trunk[f'ipa_ln_{b}'] = nn.LayerNorm(self._ipa_conf.c_s)
             tfmr_in = self._ipa_conf.c_s
             tfmr_layer = torch.nn.TransformerEncoderLayer(

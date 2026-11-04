@@ -398,12 +398,19 @@ class InvariantPointAttention(nn.Module):
             z[0] = z[0].cpu()
 
         # [*, H, N_res, N_res]
+        # this is the std attention term
         a = torch.matmul(
             permute_final_dims(q, (1, 0, 2)),  # [*, H, N_res, C_hidden]
             permute_final_dims(k, (1, 2, 0)),  # [*, H, C_hidden, N_res]
         )
-        a *= math.sqrt(1.0 / (3 * self.c_hidden))
-        a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
+        # original version computes std attention and pair bias terms into the same tensor
+        # a *= math.sqrt(1.0 / (3 * self.c_hidden))
+        # a += (math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)))
+
+        a = a * math.sqrt(1.0 / (3 * self.c_hidden))
+        _content = a
+        _pair = math.sqrt(1.0 / 3) * permute_final_dims(b, (2, 0, 1)) # pair bias term
+        a = a + _pair
 
         # [*, N_res, N_res, H, P_q, 3]
         pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
@@ -429,11 +436,17 @@ class InvariantPointAttention(nn.Module):
         square_mask = self.inf * (square_mask - 1)
 
         # [*, H, N_res, N_res]
-        pt_att = permute_final_dims(pt_att, (2, 0, 1))
+        pt_att = permute_final_dims(pt_att, (2, 0, 1)) # geometry term
+        _geom = pt_att
         
         a = a + pt_att 
         a = a + square_mask.unsqueeze(-3)
         a = self.softmax(a)
+        sparse_pair.record_attention(
+            a, r.get_trans(), mask, self.layer_idx,
+            parts={"content": _content, "pair": _pair, "geom": _geom},
+            mask_logits=square_mask.unsqueeze(-3),
+        )
 
         ################
         # Compute output

@@ -207,7 +207,43 @@ def configure_from_env() -> SparsityConfig:
     return CONFIG
 
 
+RECORD: bool = False
+RECORD_KS: List[int] = [8, 16, 32, 64, 128]
+RECORD_STRIDE: int = 1
+_RECORDS: List[dict] = []
+
+
+def recording_enabled_from_env() -> Optional[str]:
+    """
+    Check whether Phase 1 recording was requested via the environment.
+
+    Recording is expensive (a distance sort per IPA call), so it is opt-in and
+    strided rather than always on.
+
+    Recognised variables:
+        PB_RECORD_OUT     path to a JSONL file; enables recording when set
+        PB_RECORD_STRIDE  record every Nth sampling step (default 10)
+        PB_RECORD_KS      comma-separated neighborhood sizes to measure
+
+    Returns:
+        str | None: Output path if recording is enabled, else None.
+    """
+    import os
+
+    global RECORD, RECORD_STRIDE, RECORD_KS
+    out = os.environ.get("PB_RECORD_OUT")
+    if not out:
+        return None
+    RECORD = True
+    RECORD_STRIDE = int(os.environ.get("PB_RECORD_STRIDE", 10))
+    raw_ks = os.environ.get("PB_RECORD_KS")
+    if raw_ks:
+        RECORD_KS = [int(x) for x in raw_ks.split(",") if x.strip()]
+    return out
+
+
 configure_from_env()
+recording_enabled_from_env()
 
 
 @contextlib.contextmanager
@@ -335,35 +371,6 @@ def apply_to_pair_mask(
     return square_mask * neighborhood_mask(coords, valid)
 
 
-def recording_enabled_from_env() -> Optional[str]:
-    """
-    Check whether Phase 1 recording was requested via the environment.
-
-    Recording is expensive (a distance sort per IPA call), so it is opt-in and
-    strided rather than always on.
-
-    Recognised variables:
-        PB_RECORD_OUT     path to a JSONL file; enables recording when set
-        PB_RECORD_STRIDE  record every Nth sampling step (default 10)
-        PB_RECORD_KS      comma-separated neighborhood sizes to measure
-
-    Returns:
-        str | None: Output path if recording is enabled, else None.
-    """
-    import os
-
-    global RECORD, RECORD_STRIDE, RECORD_KS
-    out = os.environ.get("PB_RECORD_OUT")
-    if not out:
-        return None
-    RECORD = True
-    RECORD_STRIDE = int(os.environ.get("PB_RECORD_STRIDE", 10))
-    raw_ks = os.environ.get("PB_RECORD_KS")
-    if raw_ks:
-        RECORD_KS = [int(x) for x in raw_ks.split(",") if x.strip()]
-    return out
-
-
 @contextlib.contextmanager
 def recording(ks: Optional[List[int]] = None):
     """
@@ -383,113 +390,126 @@ def recording(ks: Optional[List[int]] = None):
     finally:
         RECORD, RECORD_KS = prev_record, prev_ks
 
-# @torch.no_grad()
-# def record_attention(
-#     a: torch.Tensor,
-#     coords: Optional[torch.Tensor],
-#     valid: torch.Tensor,
-#     layer_idx: Optional[int] = None,
-#     parts: Optional[dict] = None,
-#     mask_logits: Optional[torch.Tensor] = None,
-# ) -> None:
-#     """
-#     Measure how much attention mass falls inside spatial neighborhoods.
 
-#     This answers the question the masking experiment presupposes: before
-#     restricting anything, how much of the dense model's attention is already
-#     spatially local, and how does that change over the trajectory?
+def take_records() -> List[dict]:
+    """
+    Drain the recorded statistics.
 
-#     Args:
-#         a: [B, H, N, N] post-softmax attention weights.
-#         coords: [B, N, 3] current noisy coordinates, or None.
-#         valid: [B, N] residue mask.
-#         layer_idx: Index of the calling layer.
-#     """
-#     if not RECORD or coords is None:
-#         return
-#     if RECORD_STRIDE > 1 and (_STEP_IDX % RECORD_STRIDE) != 0:
-#         return
+    Returns:
+        list[dict]: One entry per recorded IPA call.
+    """
+    global _RECORDS
+    out, _RECORDS = _RECORDS, []
+    return out
 
-#     valid_b = valid.bool()
-#     B, H, N, _ = a.shape
-#     n_real = valid_b.sum(-1)
 
-#     # Entropy of each query's attention, averaged over real residues/heads.
-#     p = a.clamp_min(1e-12)
-#     ent = -(p * p.log()).sum(-1)
-#     row_valid = valid_b.unsqueeze(1).expand(B, H, N)
-#     mean_ent = (ent * row_valid).sum() / row_valid.sum().clamp_min(1)
+@torch.no_grad()
+def record_attention(
+    a: torch.Tensor,
+    coords: Optional[torch.Tensor],
+    valid: torch.Tensor,
+    layer_idx: Optional[int] = None,
+    parts: Optional[dict] = None,
+    mask_logits: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Measure how much attention mass falls inside spatial neighborhoods.
 
-#     dist = torch.cdist(coords.float(), coords.float())
-#     dist = dist.masked_fill(~valid_b.unsqueeze(-2), float("inf"))
-#     eye = torch.eye(N, device=a.device, dtype=torch.bool).unsqueeze(0)
-#     dist = dist.masked_fill(eye, -1.0)
-#     order = dist.argsort(dim=-1)
+    This answers the question the masking experiment presupposes: before
+    restricting anything, how much of the dense model's attention is already
+    spatially local, and how does that change over the trajectory?
 
-#     # Per head as well as pooled: a mean over 8 heads cannot distinguish
-#     # "all heads moderately local" from "half global, half pinned", and those
-#     # imply different things about what a sparse architecture could drop.
-#     ent_h = (ent * row_valid).sum(-1) / row_valid.sum(-1).clamp_min(1)  # (B, H)
-#     eff_h = ent_h.exp().mean(0)                                         # (H,)
+    Args:
+        a: [B, H, N, N] post-softmax attention weights.
+        coords: [B, N, 3] current noisy coordinates, or None.
+        valid: [B, N] residue mask.
+        layer_idx: Index of the calling layer.
+    """
+    if not RECORD or coords is None:
+        return
+    if RECORD_STRIDE > 1 and (_STEP_IDX % RECORD_STRIDE) != 0:
+        return
 
-#     entry = {
-#         "layer": layer_idx,
-#         "t_frac": _T_FRAC,
-#         "step": _STEP_IDX,
-#         "n_res": float(n_real.float().mean()),
-#         "attn_entropy": float(mean_ent),
-#         "eff_neighbors": float(mean_ent.exp()),
-#         "eff_by_head": [round(float(x), 3) for x in eff_h],
-#         # exp(mean entropy) is a geometric mean over (residue, head), so a few
-#         # global heads get buried by many local ones. The arithmetic version
-#         # keeps them visible; reporting both shows the heterogeneity.
-#         "eff_arith": float(((ent.exp() * row_valid).sum() / row_valid.sum().clamp_min(1))),
-#     }
+    valid_b = valid.bool()
+    B, H, N, _ = a.shape
+    n_real = valid_b.sum(-1)
 
-#     # Keys with nonzero weight. Masked logits sit ~1e5 down and underflow to
-#     # exactly 0, so under a hard restriction this is the kept set; it is how
-#     # the adaptive modes report the budget they chose.
-#     sup = (a > 0).sum(-1).float()                                       # (B, H, N)
-#     sup_h = (sup * row_valid).sum(-1) / row_valid.sum(-1).clamp_min(1)  # (B, H)
-#     entry["support"] = float((sup * row_valid).sum() / row_valid.sum().clamp_min(1))
-#     entry["support_by_head"] = [round(float(x), 2) for x in sup_h.mean(0)]
+    # Entropy of each query's attention, averaged over real residues/heads.
+    p = a.clamp_min(1e-12)
+    ent = -(p * p.log()).sum(-1)
+    row_valid = valid_b.unsqueeze(1).expand(B, H, N)
+    mean_ent = (ent * row_valid).sum() / row_valid.sum().clamp_min(1)
 
-#     # Each logit term softmaxed alone, on the real noised trajectory. The
-#     # distance term is architectural and present at init; the content term is
-#     # learned. Without separating them, a broad early curve cannot distinguish
-#     # the trained model overriding the geometric prior from that prior simply
-#     # being dormant at prior-scale coordinates.
-#     if parts is not None:
-#         # All 8 subsets of {content, pair, geom}, mask always on. Standalone
-#         # and leave-one-out bound the interaction from opposite sides: a term
-#         # alone versus a term absent. They agree only if it acts additively,
-#         # and the full attention here is sharper than every standalone term,
-#         # which already says they do not. Shapley over these 8 is then an
-#         # order-independent attribution. The empty subset is uniform over
-#         # valid residues and doubles as a sanity check.
-#         names = ["content", "pair", "geom"]
-#         terms = [parts[n] for n in names]
-#         for bits in range(8):
-#             sel = [i for i in range(3) if (bits >> i) & 1]
-#             logits = torch.zeros_like(a) if mask_logits is None else mask_logits.expand_as(a).clone()
-#             for i in sel:
-#                 logits = logits + terms[i]
-#             q = torch.softmax(logits, dim=-1).clamp_min(1e-12)
-#             e = -(q * q.log()).sum(-1)
-#             mm = (e * row_valid).sum() / row_valid.sum().clamp_min(1)
-#             key = "".join(names[i][0] for i in sel) or "none"
-#             entry[f"eff_s_{key}"] = round(float(mm.exp()), 3)
+    dist = torch.cdist(coords.float(), coords.float())
+    dist = dist.masked_fill(~valid_b.unsqueeze(-2), float("inf"))
+    eye = torch.eye(N, device=a.device, dtype=torch.bool).unsqueeze(0)
+    dist = dist.masked_fill(eye, -1.0)
+    order = dist.argsort(dim=-1)
 
-#     # Fraction of attention mass captured by the k nearest neighbors.
-#     for k in RECORD_KS:
-#         if k >= N:
-#             entry[f"mass_k{k}"] = 1.0
-#             continue
-#         idx = order[..., :k]
-#         gathered = a.gather(-1, idx.unsqueeze(1).expand(B, H, N, k))
-#         mass = gathered.sum(-1)
-#         entry[f"mass_k{k}"] = float(
-#             (mass * row_valid).sum() / row_valid.sum().clamp_min(1)
-#         )
+    # Per head as well as pooled: a mean over 8 heads cannot distinguish
+    # "all heads moderately local" from "half global, half pinned", and those
+    # imply different things about what a sparse architecture could drop.
+    ent_h = (ent * row_valid).sum(-1) / row_valid.sum(-1).clamp_min(1)  # (B, H)
+    eff_h = ent_h.exp().mean(0)                                         # (H,)
 
-#     _RECORDS.append(entry)
+    entry = {
+        "layer": layer_idx,
+        "t_frac": _T_FRAC,
+        "step": _STEP_IDX,
+        "n_res": float(n_real.float().mean()),
+        "attn_entropy": float(mean_ent),
+        "eff_neighbors": float(mean_ent.exp()),
+        "eff_by_head": [round(float(x), 3) for x in eff_h],
+        # exp(mean entropy) is a geometric mean over (residue, head), so a few
+        # global heads get buried by many local ones. The arithmetic version
+        # keeps them visible; reporting both shows the heterogeneity.
+        "eff_arith": float(((ent.exp() * row_valid).sum() / row_valid.sum().clamp_min(1))),
+    }
+
+    # Keys with nonzero weight. Masked logits sit ~1e5 down and underflow to
+    # exactly 0, so under a hard restriction this is the kept set; it is how
+    # the adaptive modes report the budget they chose.
+    sup = (a > 0).sum(-1).float()                                       # (B, H, N)
+    sup_h = (sup * row_valid).sum(-1) / row_valid.sum(-1).clamp_min(1)  # (B, H)
+    entry["support"] = float((sup * row_valid).sum() / row_valid.sum().clamp_min(1))
+    entry["support_by_head"] = [round(float(x), 2) for x in sup_h.mean(0)]
+
+    # Each logit term softmaxed alone, on the real noised trajectory. The
+    # distance term is architectural and present at init; the content term is
+    # learned. Without separating them, a broad early curve cannot distinguish
+    # the trained model overriding the geometric prior from that prior simply
+    # being dormant at prior-scale coordinates.
+    if parts is not None:
+        # All 8 subsets of {content, pair, geom}, mask always on. Standalone
+        # and leave-one-out bound the interaction from opposite sides: a term
+        # alone versus a term absent. They agree only if it acts additively,
+        # and the full attention here is sharper than every standalone term,
+        # which already says they do not. Shapley over these 8 is then an
+        # order-independent attribution. The empty subset is uniform over
+        # valid residues and doubles as a sanity check.
+        names = ["content", "pair", "geom"]
+        terms = [parts[n] for n in names]
+        for bits in range(8):
+            sel = [i for i in range(3) if (bits >> i) & 1]
+            logits = torch.zeros_like(a) if mask_logits is None else mask_logits.expand_as(a).clone()
+            for i in sel:
+                logits = logits + terms[i]
+            q = torch.softmax(logits, dim=-1).clamp_min(1e-12)
+            e = -(q * q.log()).sum(-1)
+            mm = (e * row_valid).sum() / row_valid.sum().clamp_min(1)
+            key = "".join(names[i][0] for i in sel) or "none"
+            entry[f"eff_s_{key}"] = round(float(mm.exp()), 3)
+
+    # Fraction of attention mass captured by the k nearest neighbors.
+    for k in RECORD_KS:
+        if k >= N:
+            entry[f"mass_k{k}"] = 1.0
+            continue
+        idx = order[..., :k]
+        gathered = a.gather(-1, idx.unsqueeze(1).expand(B, H, N, k))
+        mass = gathered.sum(-1)
+        entry[f"mass_k{k}"] = float(
+            (mass * row_valid).sum() / row_valid.sum().clamp_min(1)
+        )
+
+    _RECORDS.append(entry)
