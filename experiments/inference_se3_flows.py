@@ -39,6 +39,8 @@ class EvalRunner:
         self._infer_cfg = cfg.inference
         self._samples_cfg = self._infer_cfg.samples
         self._rng = np.random.default_rng(self._infer_cfg.seed)
+        torch.manual_seed(self._infer_cfg.seed)
+        torch.cuda.manual_seed_all(self._infer_cfg.seed)
 
         # Set-up output directory only on rank 0
         local_rank = os.environ.get('LOCAL_RANK', 0)
