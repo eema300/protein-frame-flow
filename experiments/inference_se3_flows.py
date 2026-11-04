@@ -91,6 +91,7 @@ class EvalRunner:
             raise ValueError(f'Unknown task {self._infer_cfg.task}')
         dataloader = torch.utils.data.DataLoader(
             eval_dataset, batch_size=1, shuffle=False, drop_last=False)
+        pl.seed_everything(self._infer_cfg.seed, workers=True)
         trainer = Trainer(
             accelerator="gpu",
             strategy="ddp",
