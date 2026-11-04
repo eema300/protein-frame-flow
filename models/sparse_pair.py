@@ -272,7 +272,9 @@ def neighborhood_mask(
         # reproduces dense attention bit-for-bit.
         return torch.ones(B, N, N, device=device, dtype=coords.dtype)
 
-    if cfg.mode == "seq":
+    if cfg.mode == "knn":
+        score = torch.cdist(coords.float(), coords.float())
+    elif cfg.mode == "seq":
         pos = torch.arange(N, device=device, dtype=torch.float32)
         score = (pos.unsqueeze(-1) - pos.unsqueeze(-2)).abs().unsqueeze(0)
         score = score.expand(B, N, N).contiguous()
