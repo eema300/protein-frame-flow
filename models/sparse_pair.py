@@ -192,7 +192,6 @@ def configure_from_env() -> SparsityConfig:
 
     CONFIG.enabled = _flag("PB_SPARSE_ENABLED", CONFIG.enabled)
     CONFIG.symmetrize = _flag("PB_SPARSE_SYMMETRIZE", CONFIG.symmetrize)
-    CONFIG.shared = _flag("PB_SPARSE_SHARED", CONFIG.shared)
     CONFIG.k = float(os.environ.get("PB_SPARSE_K", CONFIG.k))
     CONFIG.k_shape = os.environ.get("PB_SPARSE_KSHAPE", CONFIG.k_shape)
     CONFIG.k_hi = float(os.environ.get("PB_SPARSE_KHI", CONFIG.k_hi))
@@ -202,7 +201,6 @@ def configure_from_env() -> SparsityConfig:
     CONFIG.t_lo = float(os.environ.get("PB_SPARSE_TLO", CONFIG.t_lo))
     CONFIG.t_hi = float(os.environ.get("PB_SPARSE_THI", CONFIG.t_hi))
     CONFIG.seed = int(os.environ.get("PB_SPARSE_SEED", CONFIG.seed))
-    CONFIG.target = os.environ.get("PB_SPARSE_TARGET", CONFIG.target)
     raw_layers = os.environ.get("PB_SPARSE_LAYERS")
     if raw_layers is not None:
         CONFIG.layers = [int(x) for x in raw_layers.split(",") if x.strip()]
