@@ -211,6 +211,7 @@ RECORD: bool = False
 RECORD_KS: List[int] = [8, 16, 32, 64, 128]
 RECORD_STRIDE: int = 1
 _RECORDS: List[dict] = []
+K_EPS: float = 0.1
 
 
 def recording_enabled_from_env() -> Optional[str]:
@@ -230,7 +231,7 @@ def recording_enabled_from_env() -> Optional[str]:
     """
     import os
 
-    global RECORD, RECORD_STRIDE, RECORD_KS
+    global RECORD, RECORD_STRIDE, RECORD_KS, K_EPS
     out = os.environ.get("PB_RECORD_OUT")
     if not out:
         return None
@@ -239,6 +240,7 @@ def recording_enabled_from_env() -> Optional[str]:
     raw_ks = os.environ.get("PB_RECORD_KS")
     if raw_ks:
         RECORD_KS = [int(x) for x in raw_ks.split(",") if x.strip()]
+    K_EPS = float(os.environ.get("PB_K_EPS", K_EPS))
     return out
 
 
@@ -499,6 +501,19 @@ def record_attention(
             mm = (e * row_valid).sum() / row_valid.sum().clamp_min(1)
             key = "".join(names[i][0] for i in sel) or "none"
             entry[f"eff_s_{key}"] = round(float(mm.exp()), 3)
+
+        # Smallest k whose top-k of the geometry distribution holds 1 - eps
+        # of its mass. Pooled over heads: the mask is shared, so the budget
+        # serves the head-averaged distribution, not any one head.
+        gl = parts["geom"].masked_fill(~valid_b[:, None, None, :], float("-inf"))
+        g = torch.softmax(gl, dim=-1).mean(1)              # (B, N, N), head-pooled
+        s, _ = g.sort(dim=-1, descending=True)
+        cum = s.cumsum(-1)
+        need = (cum < (1.0 - K_EPS)).sum(-1) + 1           # (B, N)
+        need = need.clamp(max=int(n_real.max()))
+        entry["k_eps"] = float((need * valid_b).sum() / valid_b.sum().clamp_min(1))
+        entry["k_eps_p95"] = float(torch.quantile(
+            need[valid_b].float(), 0.95))
 
     # Fraction of attention mass captured by the k nearest neighbors.
     for k in RECORD_KS:
