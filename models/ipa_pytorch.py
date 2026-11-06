@@ -428,17 +428,19 @@ class InvariantPointAttention(nn.Module):
 
         # [*, N_res, N_res, H]
         pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
+        
         # [*, N_res, N_res]
         square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
+        
+        # [*, H, N_res, N_res]
+        pt_att = permute_final_dims(pt_att, (2, 0, 1)) # geometry term
+        _geom = pt_att
+
         square_mask = sparse_pair.apply_to_pair_mask(
             square_mask, r.get_trans(), mask, self.layer_idx
         )
         square_mask = self.inf * (square_mask - 1)
 
-        # [*, H, N_res, N_res]
-        pt_att = permute_final_dims(pt_att, (2, 0, 1)) # geometry term
-        _geom = pt_att
-        
         a = a + pt_att 
         a = a + square_mask.unsqueeze(-3)
         a = self.softmax(a)

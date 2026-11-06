@@ -284,6 +284,7 @@ def neighborhood_mask(
     coords: torch.Tensor,
     valid: torch.Tensor,
     config: Optional[SparsityConfig] = None,
+    logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Build a binary neighborhood mask over residue pairs.
@@ -314,6 +315,12 @@ def neighborhood_mask(
 
     if cfg.mode == "knn":
         score = torch.cdist(coords.float(), coords.float())
+    elif cfg.mode == "logit":
+        if logits is None:
+            raise ValueError("mode 'logit' requires logits")
+        # Head-pooled pair+geom score; negated because topk below takes the
+        # smallest, and we want the largest logits.
+        score = -logits.mean(1).float()
     elif cfg.mode == "seq":
         pos = torch.arange(N, device=device, dtype=torch.float32)
         score = (pos.unsqueeze(-1) - pos.unsqueeze(-2)).abs().unsqueeze(0)
@@ -352,6 +359,7 @@ def apply_to_pair_mask(
     coords: Optional[torch.Tensor],
     valid: torch.Tensor,
     layer_idx: Optional[int] = None,
+    logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Gate an existing pairwise validity mask by the neighborhood mask.
@@ -372,7 +380,7 @@ def apply_to_pair_mask(
     """
     if coords is None or not CONFIG.active_at(_T_FRAC, layer_idx):
         return square_mask
-    return square_mask * neighborhood_mask(coords, valid)
+    return square_mask * neighborhood_mask(coords, valid, logits)
 
 
 @contextlib.contextmanager
