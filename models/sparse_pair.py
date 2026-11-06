@@ -77,6 +77,7 @@ class SparsityConfig:
     k_hi: float = 0.0
     k_lo: float = 0.0
     k_frac: bool = False
+    k_exp: float = 1.0
     mode: str = "knn"
     symmetrize: bool = True
     t_lo: float = 0.0
@@ -93,10 +94,10 @@ class SparsityConfig:
             # configured the same way as a decaying one. Reading self.k here
             # instead silently produced k=1 whenever a caller put the fraction
             # in k_hi and left k at 0.
-            return max(int(round(self.k_hi * n)), 1) if self.k_frac else int(self.k)
+            return max(int(round(self.k_hi * n ** self.k_exp)), 1) if self.k_frac else int(self.k)
         hi, lo = self.k_hi, self.k_lo
         if self.k_frac:
-            hi, lo = hi * n, lo * n
+            hi, lo = hi * n ** self.k_exp, lo * n ** self.k_exp
         t = 0.0 if t_frac is None else min(max(float(t_frac), 0.0), 1.0)
         if self.k_shape == "linear":
             k = lo + (hi - lo) * t
@@ -201,6 +202,7 @@ def configure_from_env() -> SparsityConfig:
     CONFIG.t_lo = float(os.environ.get("PB_SPARSE_TLO", CONFIG.t_lo))
     CONFIG.t_hi = float(os.environ.get("PB_SPARSE_THI", CONFIG.t_hi))
     CONFIG.seed = int(os.environ.get("PB_SPARSE_SEED", CONFIG.seed))
+    CONFIG.k_exp = float(os.environ.get("PB_SPARSE_KEXP", CONFIG.k_exp))
     raw_layers = os.environ.get("PB_SPARSE_LAYERS")
     if raw_layers is not None:
         CONFIG.layers = [int(x) for x in raw_layers.split(",") if x.strip()]
