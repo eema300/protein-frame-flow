@@ -507,15 +507,18 @@ def record_attention(
         # Smallest k whose top-k of the geometry distribution holds 1 - eps
         # of its mass. Pooled over heads: the mask is shared, so the budget
         # serves the head-averaged distribution, not any one head.
-        gl = parts["geom"].masked_fill(~valid_b[:, None, None, :], float("-inf"))
-        g = torch.softmax(gl, dim=-1).mean(1)              # (B, N, N), head-pooled
-        s, _ = g.sort(dim=-1, descending=True)
-        cum = s.cumsum(-1)
-        need = (cum < (1.0 - K_EPS)).sum(-1) + 1           # (B, N)
-        need = need.clamp(max=int(n_real.max()))
-        entry["k_eps"] = float((need * valid_b).sum() / valid_b.sum().clamp_min(1))
-        entry["k_eps_p95"] = float(torch.quantile(
-            need[valid_b].float(), 0.95))
+        for nm, tensor in [("g", parts["geom"]), ("p", parts["pair"]), ("pg", parts["pair"] + parts["geom"])]:
+            d = tensor.masked_fill(~valid_b[:, None, None, :], float("-inf"))
+            d = torch.softmax(d, dim=-1).mean(1)
+            s, _ = d.sort(dim=-1, descending=True)
+            cum = s.cumsum(-1)
+            need = (cum < (1.0 - K_EPS)).sum(-1) + 1
+            need = need.clamp(max=int(n_real.max()))
+            entry[f"k_eps_{nm}"] = float(
+                (need * valid_b).sum() / valid_b.sum().clamp_min(1))
+            entry[f"k_eps_{nm}_p95"] = float(
+                torch.quantile(need[valid_b].float(), 0.95))
+        entry["k_eps"] = entry["k_eps_g"]
 
     # Fraction of attention mass captured by the k nearest neighbors.
     for k in RECORD_KS:
