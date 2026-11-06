@@ -380,7 +380,7 @@ def apply_to_pair_mask(
     """
     if coords is None or not CONFIG.active_at(_T_FRAC, layer_idx):
         return square_mask
-    return square_mask * neighborhood_mask(coords, valid, logits)
+    return square_mask * neighborhood_mask(coords, valid, logits=logits)
 
 
 @contextlib.contextmanager
