@@ -437,7 +437,8 @@ class InvariantPointAttention(nn.Module):
         _geom = pt_att
 
         square_mask = sparse_pair.apply_to_pair_mask(
-            square_mask, r.get_trans(), mask, self.layer_idx
+            square_mask, r.get_trans(), mask, self.layer_idx,
+            logits=_pair + _geom,
         )
         square_mask = self.inf * (square_mask - 1)
 
